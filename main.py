@@ -1,319 +1,371 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Lab2主程序：特征编码与图像检索系统
-基于Lab1的特征提取结果，实现特征编码、字典构建和图像检索
+车辆视觉检索系统 - 主程序入口
+==============================
+本程序是车辆视觉检索系统的主入口，支持两种运行模式：
+1. GUI模式: 启动图形界面，交互式进行图像检索
+2. 评估模式: 命令行批量评估，对比BoF/VLAD和TF-IDF的效果
+
+使用方法:
+    python main.py --mode gui     # 启动图形界面
+    python main.py --mode eval    # 运行对比评估实验
+    python main.py --mode eval --output ./my_results  # 指定输出目录
 """
 
+import os
 import cv2
 import numpy as np
-import os
-import sys
-import json
-import time
-from typing import List, Dict, Any, Tuple
 import argparse
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端，支持无显示器环境
+import matplotlib.pyplot as plt
 
-# 添加Lab1路径以导入特征提取模块
-sys.path.append('/Users/tuxol/Documents/DataVault/CST/CV/Lab1')
-from feature_extraction import FeatureExtractor
+from feature_extractor import FeatureExtractor, FeatureEncoder
+from image_retrieval import ImageRetriever, PerformanceEvaluator, load_image_database
 
-# 导入Lab2模块
-from feature_encoding import FeatureEncoder
-from image_retrieval import ImageRetriever, PerformanceEvaluator
 
-class Lab2System:
-    """Lab2特征编码与图像检索系统"""
+# =============================================================================
+# 命令行评估模式的核心系统类
+# =============================================================================
+class ImageSearchSystem:
+    """
+    图像检索系统核心类（用于命令行评估模式）
     
-    def __init__(self, image_folder: str, dictionary_size: int = 256):
+    封装了完整的检索流程：
+    1. 加载图像并提取特征
+    2. 构建视觉词典
+    3. 编码所有图像
+    4. 在测试集上评估性能
+    """
+    
+    def __init__(self, image_folder, test_folder, codebook_size=256):
         """
-        初始化系统
-        Args:
-            image_folder: 图像文件夹路径
-            dictionary_size: 字典大小
+        初始化检索系统
+        
+        参数:
+            image_folder: 数据库图像文件夹路径
+            test_folder: 测试集图像文件夹路径
+            codebook_size: 视觉词典大小，默认256
         """
         self.image_folder = image_folder
-        self.dictionary_size = dictionary_size
+        self.test_folder = test_folder
         
-        # 初始化各个组件
-        self.feature_extractor = FeatureExtractor()
-        self.feature_encoder = FeatureEncoder(dictionary_size)
-        self.image_retriever = ImageRetriever()
-        self.performance_evaluator = PerformanceEvaluator()
+        # 初始化核心组件
+        self.extractor = FeatureExtractor()           # 特征提取器
+        self.encoder = FeatureEncoder(codebook_size)  # 特征编码器
+        self.retriever = ImageRetriever(metric="cosine")  # 图像检索器
         
         # 数据存储
-        self.image_database = {}
-        self.train_encodings = []
-        self.train_labels = []
-        self.train_paths = []
-        
-    def load_images_and_extract_features(self, algorithm: str = "SIFT"):
-        """
-        加载图像并提取特征
-        Args:
-            algorithm: 特征提取算法 ("SIFT", "KAZE", "ORB")
-        """
-        print(f"正在加载图像并使用{algorithm}提取特征...")
-        
-        image_count = 0
-        for category_folder in os.listdir(self.image_folder):
-            category_path = os.path.join(self.image_folder, category_folder)
-            if os.path.isdir(category_path) and not category_folder.startswith('.'):
-                print(f"处理类别: {category_folder}")
-                
-                for image_file in os.listdir(category_path):
-                    if image_file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
-                        image_path = os.path.join(category_path, image_file)
-                        try:
-                            image = cv2.imread(image_path)
-                            if image is not None:
-                                # 提取特征
-                                features = self.feature_extractor.extract_and_time(image, algorithm)
-                                
-                                if features['descriptors'] is not None:
-                                    self.image_database[image_path] = {
-                                        'image': image,
-                                        'category': category_folder,
-                                        'features': features,
-                                        'descriptors': features['descriptors']
-                                    }
-                                    image_count += 1
-                                    
-                        except Exception as e:
-                            print(f"处理图像失败 {image_path}: {e}")
-        
-        print(f"成功加载并提取特征的图像数量: {image_count}")
-        return image_count
+        self.database = {}          # 数据库信息 {路径: {label, descriptors}}
+        self.all_descriptors = []   # 所有图像的描述子
+        self.all_labels = []        # 所有图像的标签
+        self.all_paths = []         # 所有图像的路径
+        self.evaluator = None       # 性能评估器
     
-    def build_dictionary_and_encode(self, encoding_method: str = "BoF", 
-                                   dictionary_method: str = "kmeans"):
+    def load_and_extract(self, algorithm="SIFT"):
         """
-        构建字典并编码所有图像
-        Args:
-            encoding_method: 编码方法 ("BoF", "VLAD", "FV")
-            dictionary_method: 字典构建方法 ("kmeans", "gmm")
+        步骤1：加载数据库图像并提取特征
+        
+        参数:
+            algorithm: 特征提取算法，"SIFT"或"ORB"
         """
-        print(f"正在构建字典并使用{encoding_method}方法编码图像...")
+        print(f"[1/4] Extracting {algorithm} features...")
+        db = load_image_database(self.image_folder)
         
-        # 收集所有描述子用于构建字典
-        all_descriptors = []
-        for image_data in self.image_database.values():
-            if image_data['descriptors'] is not None:
-                all_descriptors.append(image_data['descriptors'])
+        # 清空之前的数据
+        self.database.clear()
+        self.all_descriptors, self.all_labels, self.all_paths = [], [], []
         
-        if not all_descriptors:
-            raise ValueError("没有有效的描述子用于构建字典")
+        # 遍历所有图像，提取特征
+        total = sum(len(imgs) for imgs in db.values())
+        for count, (label, paths) in enumerate(db.items()):
+            for path in paths:
+                img = cv2.imread(path)
+                if img is None:
+                    continue
+                # 提取特征
+                _, desc, _ = self.extractor.extract(img, algorithm)
+                self.database[path] = {'label': label, 'descriptors': desc}
+                if desc is not None:
+                    self.all_descriptors.append(desc)
+                    self.all_labels.append(label)
+                    self.all_paths.append(path)
         
-        # 构建字典
-        if dictionary_method == "kmeans" or encoding_method in ["BoF", "VLAD"]:
-            self.feature_encoder.build_dictionary_kmeans(all_descriptors)
-        elif dictionary_method == "gmm" or encoding_method == "FV":
-            self.feature_encoder.build_dictionary_gmm(all_descriptors)
-        
-        # 编码所有图像
-        print("正在编码所有图像...")
-        encoded_count = 0
-        
-        for image_path, image_data in self.image_database.items():
-            try:
-                # 编码图像
-                encoding = self.feature_encoder.encode_image(
-                    image_data['descriptors'], encoding_method
-                )
-                
-                # 存储编码结果
-                image_data['encoding'] = encoding
-                self.train_encodings.append(encoding)
-                self.train_labels.append(image_data['category'])
-                self.train_paths.append(image_path)
-                
-                encoded_count += 1
-                
-            except Exception as e:
-                print(f"编码图像失败 {image_path}: {e}")
-        
-        print(f"成功编码的图像数量: {encoded_count}")
-        
-        # 构建检索数据库
-        self.image_retriever.build_database(
-            self.train_encodings, self.train_labels, self.train_paths
-        )
+        print(f"  Loaded {len(self.all_paths)} images")
+        # 统计每个类别的图像数量，用于计算召回率
+        label_counts = {l: self.all_labels.count(l) for l in set(self.all_labels)}
+        self.evaluator = PerformanceEvaluator(label_counts)
     
-    def split_train_test(self, test_ratio: float = 0.2) -> Tuple[List, List]:
+    def build_codebook_and_encode(self, method="BoF", use_idf=False):
         """
-        分割训练集和测试集
-        Args:
-            test_ratio: 测试集比例
-        Returns:
-            (train_indices, test_indices)
+        步骤2-4：构建视觉词典并编码所有图像
+        
+        参数:
+            method: 编码方法，"BoF"或"VLAD"
+            use_idf: 是否使用TF-IDF加权
         """
-        # 按类别分割
-        category_indices = {}
-        for i, (image_path, image_data) in enumerate(self.image_database.items()):
-            category = image_data['category']
-            if category not in category_indices:
-                category_indices[category] = []
-            category_indices[category].append(i)
+        # 步骤2：使用K-means聚类构建视觉词典
+        print("[2/4] Building codebook...")
+        self.encoder.build_codebook(self.all_descriptors)
         
-        train_indices = []
-        test_indices = []
+        # 步骤3：计算IDF权重（可选）
+        if use_idf:
+            print("[3/4] Computing IDF...")
+            self.encoder.compute_idf(self.all_descriptors)
+        else:
+            print("[3/4] Skipping IDF...")
         
-        for category, indices in category_indices.items():
-            np.random.shuffle(indices)
-            split_point = int(len(indices) * (1 - test_ratio))
-            train_indices.extend(indices[:split_point])
-            test_indices.extend(indices[split_point:])
-        
-        print(f"训练集大小: {len(train_indices)}, 测试集大小: {len(test_indices)}")
-        return train_indices, test_indices
+        # 步骤4：编码所有数据库图像并构建检索索引
+        print(f"[4/4] Encoding with {method}...")
+        encodings = [self.encoder.encode(self.database[p]['descriptors'], method, use_idf) 
+                     for p in self.all_paths]
+        self.retriever.build_index(encodings, self.all_labels, self.all_paths)
     
-    def evaluate_system(self, test_indices: List[int], k: int = 10) -> Dict[str, Any]:
+    def evaluate(self, method="BoF", use_idf=False):
         """
-        评估系统性能
-        Args:
-            test_indices: 测试集索引
-            k: KNN的k值
-        Returns:
-            评估结果
+        在测试集上评估检索性能
+        
+        参数:
+            method: 编码方法
+            use_idf: 是否使用IDF加权
+        
+        返回:
+            metrics: 评估指标字典，包含Precision、Recall、mAP、检索时间等
         """
-        print(f"正在评估系统性能，测试集大小: {len(test_indices)}")
+        print("Evaluating...")
+        test_db = load_image_database(self.test_folder)
         
-        # 准备测试数据
-        test_encodings = []
-        test_labels = []
-        test_paths = []
+        results_list, times = [], []
+        # 对测试集中的每张图像执行检索
+        for label, paths in test_db.items():
+            for path in paths:
+                img = cv2.imread(path)
+                if img is None:
+                    continue
+                # 提取特征并编码
+                _, desc, _ = self.extractor.extract(img, "SIFT")
+                enc = self.encoder.encode(desc, method, use_idf)
+                # 执行检索
+                results, t = self.retriever.search(enc, k=10, exclude_path=path)
+                results_list.append((results, label))
+                times.append(t)
         
-        image_paths = list(self.image_database.keys())
-        for idx in test_indices:
-            image_path = image_paths[idx]
-            image_data = self.image_database[image_path]
-            test_encodings.append(image_data['encoding'])
-            test_labels.append(image_data['category'])
-            test_paths.append(image_path)
-        
-        # 执行检索
-        retrieval_results = self.image_retriever.batch_retrieve(test_encodings, k)
-        
-        # 评估性能
-        performance = self.performance_evaluator.evaluate_retrieval_performance(
-            retrieval_results, test_labels, k_values=[1, 5, 10]
-        )
-        
-        return performance, retrieval_results
-    
-    def save_results(self, performance: Dict[str, Any], 
-                    encoding_method: str, algorithm: str):
-        """
-        保存实验结果
-        Args:
-            performance: 性能评估结果
-            encoding_method: 编码方法
-            algorithm: 特征提取算法
-        """
-        # 保存性能结果
-        results = {
-            'algorithm': algorithm,
-            'encoding_method': encoding_method,
-            'dictionary_size': self.dictionary_size,
-            'performance': performance,
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        results_file = f"results/performance_{algorithm}_{encoding_method}.json"
-        with open(results_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        
-        print(f"性能结果已保存到: {results_file}")
-        
-        # 保存字典和数据库
-        dictionary_file = f"models/dictionary_{algorithm}_{encoding_method}.pkl"
-        self.feature_encoder.save_dictionary(dictionary_file)
-        
-        database_file = f"models/database_{algorithm}_{encoding_method}.pkl"
-        self.image_retriever.save_database(database_file)
-    
-    def run_experiment(self, algorithm: str = "SIFT", 
-                      encoding_method: str = "BoF",
-                      test_ratio: float = 0.2,
-                      k: int = 10):
-        """
-        运行完整实验
-        Args:
-            algorithm: 特征提取算法
-            encoding_method: 编码方法
-            test_ratio: 测试集比例
-            k: KNN的k值
-        """
-        print(f"开始运行实验: {algorithm} + {encoding_method}")
-        print("=" * 60)
-        
-        # 步骤1: 加载图像并提取特征
-        self.load_images_and_extract_features(algorithm)
-        
-        # 步骤2: 构建字典并编码
-        self.build_dictionary_and_encode(encoding_method)
-        
-        # 步骤3: 分割训练测试集
-        train_indices, test_indices = self.split_train_test(test_ratio)
-        
-        # 步骤4: 评估性能
-        performance, retrieval_results = self.evaluate_system(test_indices, k)
-        
-        # 步骤5: 保存结果
-        self.save_results(performance, encoding_method, algorithm)
-        
-        # 打印结果
-        print("\n实验结果:")
-        print("-" * 40)
-        for metric, value in performance.items():
-            print(f"{metric}: {value:.4f}")
-        
-        return performance, retrieval_results
+        # 计算评估指标
+        metrics = self.evaluator.evaluate(results_list)
+        metrics['avg_time_ms'] = np.mean(times) * 1000  # 平均检索时间
+        metrics['total_queries'] = len(results_list)    # 查询总数
+        return metrics
 
-def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description='Lab2特征编码与图像检索系统')
-    parser.add_argument('--image_folder', type=str, 
-                       default='/Users/tuxol/Documents/DataVault/CST/CV/Lab1/image',
-                       help='图像文件夹路径')
-    parser.add_argument('--algorithm', type=str, default='SIFT',
-                       choices=['SIFT', 'KAZE', 'ORB'],
-                       help='特征提取算法')
-    parser.add_argument('--encoding', type=str, default='BoF',
-                       choices=['BoF', 'VLAD', 'FV'],
-                       help='特征编码方法')
-    parser.add_argument('--dictionary_size', type=int, default=256,
-                       help='字典大小')
-    parser.add_argument('--test_ratio', type=float, default=0.2,
-                       help='测试集比例')
-    parser.add_argument('--k', type=int, default=10,
-                       help='KNN的k值')
+
+# =============================================================================
+# 对比实验
+# =============================================================================
+def run_comparison_experiment(image_folder, test_folder, output_dir):
+    """
+    运行对比实验
     
+    对比4种编码组合的检索性能：
+    1. BoF（不使用IDF）
+    2. BoF + TF-IDF
+    3. VLAD（不使用IDF）
+    4. VLAD + IDF
+    
+    参数:
+        image_folder: 数据库图像文件夹
+        test_folder: 测试集文件夹
+        output_dir: 结果输出目录
+    
+    返回:
+        results: 各方法的评估结果字典
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 4种实验配置：(编码方法, 是否使用IDF, 显示名称)
+    configs = [("BoF", False, "BoF"), ("BoF", True, "BoF+IDF"),
+               ("VLAD", False, "VLAD"), ("VLAD", True, "VLAD+IDF")]
+    
+    # 初始化系统并提取特征（只需做一次）
+    system = ImageSearchSystem(image_folder, test_folder)
+    system.load_and_extract("SIFT")
+    
+    print("\n" + "=" * 50 + "\nComparison Experiment\n" + "=" * 50)
+    
+    # 对每种配置进行评估
+    results = {}
+    for method, use_idf, name in configs:
+        print(f"\n>>> {name}")
+        system.build_codebook_and_encode(method, use_idf)
+        metrics = system.evaluate(method, use_idf)
+        results[name] = metrics
+        # 打印关键指标
+        print(f"  mAP@10: {metrics['mAP@10']*100:.1f}% | P@1: {metrics['Precision@1']*100:.1f}% | Time: {metrics['avg_time_ms']:.1f}ms")
+    
+    # 生成可视化图表和报告
+    _plot_comparison(results, output_dir)   # 精度/召回率/时间对比柱状图
+    _plot_pr_curves(results, output_dir)    # PR曲线对比
+    _plot_map_curves(results, output_dir)   # mAP@K曲线对比
+    _save_report(results, output_dir)       # 文本报告
+    
+    print(f"\nDone! Results saved to: {output_dir}")
+    return results
+
+
+# =============================================================================
+# 可视化绘图函数
+# =============================================================================
+def _plot_comparison(results, output_dir):
+    """
+    绘制性能对比柱状图
+    
+    生成包含三个子图的图表：
+    1. Precision@1/5/10对比
+    2. Recall@1/5/10对比
+    3. 平均检索时间对比
+    """
+    methods = list(results.keys())
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    x, width = np.arange(len(methods)), 0.25
+    
+    # 子图1：Precision对比
+    for i, k in enumerate([1, 5, 10]):
+        axes[0].bar(x + i*width, [results[m][f'Precision@{k}']*100 for m in methods], width, label=f'P@{k}')
+    axes[0].set_ylabel('Precision (%)')
+    axes[0].set_title('Precision')
+    axes[0].set_xticks(x + width)
+    axes[0].set_xticklabels(methods, rotation=15)
+    axes[0].legend()
+    axes[0].grid(axis='y', alpha=0.3)
+    
+    # 子图2：Recall对比
+    for i, k in enumerate([1, 5, 10]):
+        axes[1].bar(x + i*width, [results[m][f'Recall@{k}']*100 for m in methods], width, label=f'R@{k}')
+    axes[1].set_ylabel('Recall (%)')
+    axes[1].set_title('Recall')
+    axes[1].set_xticks(x + width)
+    axes[1].set_xticklabels(methods, rotation=15)
+    axes[1].legend()
+    axes[1].grid(axis='y', alpha=0.3)
+    
+    # 子图3：检索时间对比
+    axes[2].bar(methods, [results[m]['avg_time_ms'] for m in methods], color='steelblue')
+    axes[2].set_ylabel('Time (ms)')
+    axes[2].set_title('Avg Retrieval Time')
+    axes[2].tick_params(axis='x', rotation=15)
+    axes[2].grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'comparison.png'), dpi=150)
+    plt.close()
+
+
+def _plot_pr_curves(results, output_dir):
+    """
+    绘制PR曲线对比图
+    
+    在同一张图上绘制所有方法的PR曲线，便于直观比较
+    曲线越靠近右上角说明性能越好
+    """
+    plt.figure(figsize=(8, 6))
+    colors = ['blue', 'red', 'green', 'orange']
+    for (name, m), c in zip(results.items(), colors):
+        plt.plot(m['pr_curve']['recall'], m['pr_curve']['precision'], c, lw=2, label=name)
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('PR Curves')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'pr_curves.png'), dpi=150)
+    plt.close()
+
+
+def _plot_map_curves(results, output_dir):
+    """
+    绘制mAP@K曲线对比图
+    
+    展示各方法在不同K值下的mAP变化趋势
+    """
+    plt.figure(figsize=(10, 6))
+    colors = ['blue', 'red', 'green', 'orange']
+    for (name, m), c in zip(results.items(), colors):
+        # 绘制K=1到K=10的mAP曲线
+        plt.plot(range(1, 11), [m[f'mAP@{k}']*100 for k in range(1, 11)], c, lw=2, marker='o', label=name)
+    plt.xlabel('K')
+    plt.ylabel('mAP (%)')
+    plt.title('mAP@K')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.xticks(range(1, 11))
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'map_comparison.png'), dpi=150)
+    plt.close()
+
+
+def _save_report(results, output_dir):
+    """
+    保存评估报告到文本文件
+    
+    报告内容包括：
+    - 各方法的详细指标（Precision、Recall、mAP）
+    - 最佳方法总结
+    """
+    with open(os.path.join(output_dir, 'report.txt'), 'w') as f:
+        f.write("=" * 50 + "\nEvaluation Report\n" + "=" * 50 + "\n\n")
+        
+        # 输出每种方法的详细指标
+        for name, m in results.items():
+            f.write(f"--- {name} ---\n")
+            f.write(f"Queries: {m['total_queries']} | Time: {m['avg_time_ms']:.1f}ms\n")
+            for k in [1, 5, 10]:
+                f.write(f"  @{k}: P={m[f'Precision@{k}']*100:.1f}% R={m[f'Recall@{k}']*100:.1f}% mAP={m[f'mAP@{k}']*100:.1f}%\n")
+            f.write("\n")
+        
+        # 找出最佳方法并总结
+        best_map = max(results.items(), key=lambda x: x[1]['mAP@10'])
+        best_p1 = max(results.items(), key=lambda x: x[1]['Precision@1'])
+        f.write(f"Best mAP@10: {best_map[0]} ({best_map[1]['mAP@10']*100:.1f}%)\n")
+        f.write(f"Best P@1: {best_p1[0]} ({best_p1[1]['Precision@1']*100:.1f}%)\n")
+
+
+# =============================================================================
+# 主程序入口
+# =============================================================================
+def main():
+    """
+    主函数：解析命令行参数，启动相应模式
+    
+    支持的参数：
+        --mode: 运行模式，"gui"（图形界面）或"eval"（命令行评估）
+        --image_folder: 数据库图像文件夹路径（可选）
+        --test_folder: 测试集文件夹路径（可选）
+        --output: 评估结果输出目录（可选，默认./results）
+    """
+    # 创建命令行参数解析器
+    parser = argparse.ArgumentParser(description='Vehicle Image Retrieval System')
+    parser.add_argument('--mode', default='gui', choices=['gui', 'eval'], help='gui or eval')
+    parser.add_argument('--image_folder', help='Database folder')
+    parser.add_argument('--test_folder', help='Test folder')
+    parser.add_argument('--output', default='./results', help='Output directory')
     args = parser.parse_args()
     
-    # 创建输出目录
-    os.makedirs('results', exist_ok=True)
-    os.makedirs('models', exist_ok=True)
-    os.makedirs('outputs', exist_ok=True)
+    # 确定数据文件夹路径（如果未指定，使用默认的上级目录结构）
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.dirname(script_dir)
+    image_folder = args.image_folder or os.path.join(base_dir, "image")
+    test_folder = args.test_folder or os.path.join(base_dir, "test")
     
-    # 创建系统实例
-    system = Lab2System(args.image_folder, args.dictionary_size)
-    
-    # 运行实验
-    try:
-        performance, retrieval_results = system.run_experiment(
-            algorithm=args.algorithm,
-            encoding_method=args.encoding,
-            test_ratio=args.test_ratio,
-            k=args.k
-        )
-        
-        print(f"\n实验完成！结果已保存到results/目录")
-        
-    except Exception as e:
-        print(f"实验运行失败: {e}")
-        import traceback
-        traceback.print_exc()
+    # 根据模式启动相应功能
+    if args.mode == 'gui':
+        print("Launching GUI...")
+        from gui_app import main as gui_main
+        gui_main()
+    else:
+        print("Running evaluation...")
+        run_comparison_experiment(image_folder, test_folder, args.output)
+
 
 if __name__ == "__main__":
     main()
