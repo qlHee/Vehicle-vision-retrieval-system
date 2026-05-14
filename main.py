@@ -351,11 +351,11 @@ def main():
     parser.add_argument('--output', default='./results', help='Output directory')
     args = parser.parse_args()
     
-    # 确定数据文件夹路径（如果未指定，使用默认的上级目录结构）
+    # 确定数据文件夹路径（如果未指定，使用data文件夹）
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    base_dir = os.path.dirname(script_dir)
-    image_folder = args.image_folder or os.path.join(base_dir, "image")
-    test_folder = args.test_folder or os.path.join(base_dir, "test")
+    data_dir = os.path.join(script_dir, "data")
+    image_folder = args.image_folder or os.path.join(data_dir, "image")
+    test_folder = args.test_folder or os.path.join(data_dir, "test")
     
     # 根据模式启动相应功能
     if args.mode == 'gui':

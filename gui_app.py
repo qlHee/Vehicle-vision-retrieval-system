@@ -26,6 +26,8 @@ import numpy as np
 from PIL import Image, ImageTk
 import os
 import threading
+import pickle
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import matplotlib
 matplotlib.use('TkAgg')  # 使用TkAgg后端，使matplotlib可以嵌入Tkinter
@@ -34,6 +36,39 @@ from matplotlib.figure import Figure
 
 from feature_extractor import FeatureExtractor, FeatureEncoder
 from image_retrieval import ImageRetriever, PerformanceEvaluator, load_image_database
+
+
+# 缓存格式版本号。version>=2 使用"相对路径"存储，保证项目被复制/移动后缓存依然可用
+CACHE_FORMAT_VERSION = 2
+
+
+def compute_database_hash(image_folder):
+    """
+    计算数据库文件夹的哈希值，用于检测数据库是否发生变化。
+
+    关键点：使用相对于image_folder的"相对路径"+文件大小生成哈希，
+    并对所有条目排序后再计算，因此：
+      - 项目被复制或移动到其他绝对路径后，哈希值保持不变（缓存仍可用）；
+      - 不同操作系统/文件系统的目录遍历顺序差异也不会影响结果。
+    （沿用原设计：只用文件大小而非修改时间，避免无意义的误判。）
+
+    参数:
+        image_folder: 数据库图像根目录
+
+    返回:
+        md5哈希字符串
+    """
+    hash_data = []
+    for root, dirs, files in os.walk(image_folder):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]  # 跳过隐藏文件夹
+        for f in files:
+            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                filepath = os.path.join(root, f)
+                fsize = os.path.getsize(filepath)
+                relpath = os.path.relpath(filepath, image_folder)
+                hash_data.append(f"{relpath}:{fsize}")
+    hash_data.sort()  # 排序保证跨运行/跨平台的确定性
+    return hashlib.md5('\n'.join(hash_data).encode()).hexdigest()
 
 
 class ImageSearchApp:
@@ -75,6 +110,10 @@ class ImageSearchApp:
         self.current_results = None    # 当前检索结果列表
         self.database_data = {}        # 数据库数据缓存 {路径: {label, sift_desc, orb_desc}}
         self.index_cache = {}          # 预计算的检索索引缓存 {(算法, 编码, IDF): retriever}
+        
+        # 缓存文件路径
+        self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', '.cache')
+        self.cache_file = os.path.join(self.cache_dir, 'database_cache.pkl')
         
         # GUI控件变量（用于获取用户选择）
         self.algorithm_var = tk.StringVar(value="SIFT")   # 特征算法选择
@@ -134,15 +173,17 @@ class ImageSearchApp:
                   ).grid(row=3, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 选择图像
         self.search_btn = ttk.Button(ctrl, text="Search", command=self._start_search, state="disabled")
         self.search_btn.grid(row=4, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 搜索按钮，初始禁用
+        self.reorder_btn = ttk.Button(ctrl, text="Reorder", command=self._reorder_results, state="disabled")
+        self.reorder_btn.grid(row=5, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 重排序按钮
         ttk.Button(ctrl, text="Evaluate", command=self._run_evaluation
-                  ).grid(row=5, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 评估按钮
+                  ).grid(row=6, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 评估按钮
         ttk.Button(ctrl, text="Histogram", command=self._show_encoding_histogram
-                  ).grid(row=6, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 直方图按钮
+                  ).grid(row=7, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 直方图按钮
         
         # 状态显示标签
         self.status_var = tk.StringVar(value="Loading database...")
         ttk.Label(ctrl, textvariable=self.status_var, foreground="blue", wraplength=200
-                 ).grid(row=7, column=0, columnspan=2, pady=10)
+                 ).grid(row=8, column=0, columnspan=2, pady=10)
         
         # PR曲线显示区域（右侧）- 先pack以确保显示
         prf = ttk.LabelFrame(top, text="PR Curve", padding=5, width=360)
@@ -191,19 +232,187 @@ class ImageSearchApp:
         self.pr_figure.tight_layout()
     
     # =========================================================================
+    # 缓存管理
+    # =========================================================================
+    def _get_database_hash(self):
+        """
+        计算数据库文件夹的哈希值，用于检测数据库是否发生变化。
+        基于相对路径计算，保证项目被复制/移动后哈希不变。详见
+        模块级函数 compute_database_hash。
+        """
+        return compute_database_hash(self.image_folder)
+
+    def _to_rel(self, abs_path):
+        """将数据库内的绝对路径转换为相对于image_folder的相对路径（用于写入缓存）"""
+        return os.path.relpath(abs_path, self.image_folder)
+
+    def _to_abs(self, rel_path):
+        """将缓存中的相对路径还原为当前image_folder下的绝对路径（用于读取缓存）"""
+        return os.path.normpath(os.path.join(self.image_folder, rel_path))
+    
+    def _save_cache(self, all_paths, all_labels, label_counts):
+        """
+        保存预计算数据到缓存文件。
+
+        为保证项目被复制/移动后缓存仍可用，所有图像路径均以"相对于
+        image_folder的相对路径"形式存储，加载时再还原为当前绝对路径。
+        """
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+        # 准备索引缓存数据（只保存encodings/labels/paths，不保存knn对象）
+        # paths转为相对路径
+        index_data = {}
+        for key, retriever in self.index_cache.items():
+            index_data[key] = {
+                'encodings': retriever.encodings,
+                'labels': retriever.labels,
+                'paths': [self._to_rel(p) for p in retriever.paths]
+            }
+
+        # database_data的键(绝对路径)转为相对路径
+        database_data_rel = {self._to_rel(p): v for p, v in self.database_data.items()}
+
+        cache_data = {
+            'version': CACHE_FORMAT_VERSION,
+            'hash': self._get_database_hash(),
+            'database_data': database_data_rel,
+            'sift_codebook': self.encoder.codebook,
+            'sift_idf': self.encoder.idf_weights,
+            'orb_codebook': self.orb_encoder.codebook,
+            'orb_idf': self.orb_encoder.idf_weights,
+            'index_data': index_data,
+            'all_paths': [self._to_rel(p) for p in all_paths],
+            'all_labels': all_labels,
+            'label_counts': label_counts
+        }
+
+        with open(self.cache_file, 'wb') as f:
+            pickle.dump(cache_data, f)
+        print(f"Cache saved to {self.cache_file}")
+    
+    def _load_cache(self):
+        """
+        从缓存文件加载预计算数据。
+
+        缓存中的路径以相对路径存储，加载时还原为当前image_folder下的绝对路径，
+        因此项目被复制/移动到新位置后，缓存依然能直接使用，无需重新预处理。
+
+        为兼容旧版（version<2，存储绝对路径）缓存：若检测到旧格式，则尝试把
+        绝对路径按"标签/文件名"重映射到当前目录；只要图像内容未变（哈希基于
+        相对路径+大小），即可直接复用，避免重新提取特征。
+
+        返回:
+            True: 缓存有效并成功加载
+            False: 缓存不存在或已过期
+        """
+        if not os.path.exists(self.cache_file):
+            return False
+
+        try:
+            with open(self.cache_file, 'rb') as f:
+                cache_data = pickle.load(f)
+
+            version = cache_data.get('version', 1)
+
+            # 路径还原函数：v2+用相对路径直接拼接；v1(旧)用绝对路径取"标签/文件名"重映射
+            if version >= CACHE_FORMAT_VERSION:
+                to_abs = self._to_abs
+            else:
+                def to_abs(p):
+                    label = os.path.basename(os.path.dirname(p))
+                    fn = os.path.basename(p)
+                    return os.path.normpath(os.path.join(self.image_folder, label, fn))
+
+            # 检查哈希值，确保数据库没有变化
+            # 旧版缓存的hash基于绝对路径，移动后必然不匹配，因此对旧版改用
+            # "文件存在性 + 数量一致"作为有效性判断，从而仍能复用其特征数据。
+            if version >= CACHE_FORMAT_VERSION:
+                if cache_data.get('hash') != self._get_database_hash():
+                    print("Database changed, cache invalidated")
+                    return False
+            else:
+                cached_rel = sorted(
+                    os.path.join(os.path.basename(os.path.dirname(p)), os.path.basename(p))
+                    for p in cache_data.get('all_paths', [])
+                )
+                current_rel = []
+                for root, dirs, files in os.walk(self.image_folder):
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    for fn in files:
+                        if fn.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                            current_rel.append(os.path.join(
+                                os.path.basename(root), fn))
+                current_rel.sort()
+                if cached_rel != current_rel:
+                    print("Database changed, legacy cache invalidated")
+                    return False
+
+            # 恢复数据（database_data的键还原为绝对路径）
+            self.database_data = {to_abs(p): v for p, v in cache_data['database_data'].items()}
+            self.encoder.codebook = cache_data['sift_codebook']
+            self.encoder.idf_weights = cache_data['sift_idf']
+            self.orb_encoder.codebook = cache_data['orb_codebook']
+            self.orb_encoder.idf_weights = cache_data['orb_idf']
+
+            # 重建检索索引（需要重新fit KNN模型），paths还原为绝对路径
+            for key, data in cache_data['index_data'].items():
+                retriever = ImageRetriever(metric="cosine")
+                retriever.encodings = data['encodings']
+                retriever.labels = data['labels']
+                retriever.paths = [to_abs(p) for p in data['paths']]
+                from sklearn.neighbors import NearestNeighbors
+                retriever.knn = NearestNeighbors(metric=retriever.metric, algorithm='brute')
+                retriever.knn.fit(retriever.encodings)
+                self.index_cache[key] = retriever
+
+            self.all_paths = [to_abs(p) for p in cache_data['all_paths']]
+            self.all_labels = cache_data['all_labels']
+            self.evaluator = PerformanceEvaluator(cache_data['label_counts'])
+
+            print(f"Cache loaded from {self.cache_file}")
+
+            # 旧版缓存：加载成功后立即以新格式(相对路径)重写，后续移动即可零成本复用
+            if version < CACHE_FORMAT_VERSION:
+                try:
+                    self._save_cache(self.all_paths, self.all_labels,
+                                     cache_data['label_counts'])
+                    print("Legacy cache upgraded to portable format (v%d)" % CACHE_FORMAT_VERSION)
+                except Exception as e:
+                    print(f"Cache upgrade skipped: {e}")
+
+            return True
+
+        except Exception as e:
+            print(f"Cache load failed: {e}")
+            return False
+    
+    # =========================================================================
     # 数据库加载（异步执行，并行构建索引）
     # =========================================================================
     def _load_database_async(self):
         """
         异步加载数据库并预计算所有编码组合
         
+        优先从缓存加载，若缓存无效则重新计算并保存缓存
         加载过程在后台线程执行，不阻塞GUI：
-        1. 提取所有图像的SIFT和ORB特征
-        2. 使用K-means构建视觉词典
-        3. 并行预计算4种编码组合的检索索引
+        1. 尝试加载缓存
+        2. 若缓存无效：提取所有图像的SIFT和ORB特征
+        3. 使用K-means构建视觉词典
+        4. 并行预计算8种编码组合的检索索引
+        5. 保存缓存供下次使用
         """
         def load():
             try:
+                # 首先尝试从缓存加载
+                self.root.after(0, lambda: self.status_var.set("Checking cache..."))
+                if self._load_cache():
+                    self.database_loaded = True
+                    self.root.after(0, self._on_database_loaded)
+                    return
+                
+                # 缓存无效，重新计算
+                self.root.after(0, lambda: self.status_var.set("Cache miss, extracting features..."))
+                
                 # 加载图像数据库（按文件夹结构）
                 db = load_image_database(self.image_folder)
                 total = sum(len(imgs) for imgs in db.values())
@@ -280,6 +489,10 @@ class ImageSearchApp:
                 label_counts = {lbl: all_labels.count(lbl) for lbl in set(all_labels)}
                 self.evaluator = PerformanceEvaluator(label_counts)
                 self.all_paths, self.all_labels = all_paths, all_labels
+                
+                # 保存缓存供下次使用
+                self.root.after(0, lambda: self.status_var.set("Saving cache..."))
+                self._save_cache(all_paths, all_labels, label_counts)
                 
                 # 标记加载完成，触发回调
                 self.database_loaded = True
@@ -379,6 +592,7 @@ class ImageSearchApp:
         results, search_time = self.index_cache[key].search(query_enc, k=10, exclude_path=self.query_path)
         
         self.current_results = results
+        self.reorder_btn.config(state="normal")  # 启用重排序按钮
         self._show_results(results, ext_time, search_time, algo, method, use_idf)
     
     def _show_results(self, results, ext_time, search_time, algo, method, use_idf):
@@ -637,21 +851,179 @@ class ImageSearchApp:
         
         fig.tight_layout()
         FigureCanvasTkAgg(fig, win).get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    
+    # =========================================================================
+    # 基于图的图像重排序
+    # =========================================================================
+    def _reorder_results(self):
+        """
+        使用基于图的方法对检索结果进行重排序
+        
+        基于图的重排序步骤：
+        1. 构建相似性图：节点为图像，边权重为图像间相似度
+        2. 多图学习：结合查询图像与检索结果之间的关系
+        3. 图排序：使用manifold ranking算法重新排序
+        """
+        if self.current_results is None or len(self.current_results) == 0:
+            messagebox.showwarning("Warning", "Please run search first")
+            return
+        
+        self.status_var.set("Reordering...")
+        
+        algo = self.algorithm_var.get()
+        method = self.encoding_var.get()
+        use_idf = self.use_idf_var.get()
+        
+        # 选择对应的编码器
+        encoder = self.encoder if algo == "SIFT" else self.orb_encoder
+        desc_key = 'sift_desc' if algo == "SIFT" else 'orb_desc'
+        
+        # 获取查询图像编码
+        _, query_desc, _ = self.extractor.extract(self.query_image, algo)
+        query_enc = encoder.encode(query_desc, method, use_idf)
+        
+        # 获取所有检索结果的编码
+        result_encodings = []
+        valid_results = []
+        for r in self.current_results:
+            desc = self.database_data.get(r['path'], {}).get(desc_key)
+            if desc is not None:
+                enc = encoder.encode(desc, method, use_idf)
+                result_encodings.append(enc)
+                valid_results.append(r)
+        
+        if len(valid_results) < 2:
+            self.status_var.set("Not enough results to reorder")
+            return
+        
+        # 执行基于图的重排序
+        reordered_results = self._graph_based_rerank(
+            query_enc, result_encodings, valid_results
+        )
+        
+        # 更新结果并显示
+        self.current_results = reordered_results
+        
+        # 获取原始提取时间（重排序不重新计算）
+        ext_time = 0
+        rerank_time = 0
+        
+        self._show_results(reordered_results, ext_time, rerank_time, algo, method, use_idf)
+        self.status_var.set("Reordering Done")
+        
+        # 在信息文本框追加重排序说明
+        self.info_text.insert(tk.END, "\n=== Graph-based Reranking Applied ===\n")
+    
+    def _graph_based_rerank(self, query_enc, result_encodings, results):
+        """
+        基于图的重排序算法实现
+        
+        算法原理：
+        1. 构建相似性图：计算所有图像之间的相似度矩阵
+        2. 图内学习：利用检索结果之间的相似关系进行信息传播
+        3. 图间学习：结合查询图像与候选图像的关系
+        4. 融合排序：综合考虑原始分数和图传播分数
+        
+        参数:
+            query_enc: 查询图像的编码向量
+            result_encodings: 检索结果的编码向量列表
+            results: 检索结果列表
+        
+        返回:
+            重排序后的结果列表
+        """
+        n = len(results)
+        encodings = np.array(result_encodings)
+        
+        # Step 1: 计算相似度矩阵（余弦相似度）
+        # 归一化编码向量
+        norms = np.linalg.norm(encodings, axis=1, keepdims=True)
+        norms[norms == 0] = 1  # 避免除零
+        normalized_encodings = encodings / norms
+        
+        # 计算检索结果之间的相似度矩阵 (n x n)
+        similarity_matrix = np.dot(normalized_encodings, normalized_encodings.T)
+        
+        # 计算查询图像与每个结果的相似度
+        query_norm = np.linalg.norm(query_enc)
+        if query_norm > 0:
+            normalized_query = query_enc / query_norm
+        else:
+            normalized_query = query_enc
+        query_similarity = np.dot(normalized_encodings, normalized_query)
+        
+        # Step 2: 构建图的邻接矩阵（使用高斯核）
+        # 将相似度转换为亲和度（affinity）
+        sigma = 0.5  # 高斯核参数
+        affinity_matrix = np.exp((similarity_matrix - 1) / (2 * sigma ** 2))
+        np.fill_diagonal(affinity_matrix, 0)  # 对角线置零
+        
+        # Step 3: 计算归一化拉普拉斯矩阵
+        # D^(-1/2) * W * D^(-1/2)
+        degree = np.sum(affinity_matrix, axis=1)
+        degree[degree == 0] = 1  # 避免除零
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(degree))
+        normalized_affinity = D_inv_sqrt @ affinity_matrix @ D_inv_sqrt
+        
+        # Step 4: Manifold Ranking 迭代
+        # 初始分数为查询相似度
+        alpha = 0.5  # 平衡参数：原始分数与传播分数的权重
+        y = query_similarity.copy()  # 初始标签
+        f = y.copy()  # 当前分数
+        
+        # 迭代传播
+        max_iter = 20
+        for _ in range(max_iter):
+            f_new = alpha * (normalized_affinity @ f) + (1 - alpha) * y
+            if np.allclose(f, f_new, atol=1e-6):
+                break
+            f = f_new
+        
+        # Step 5: 结合原始排序分数
+        # 原始距离转换为分数（距离越小分数越高）
+        original_scores = np.array([1.0 / (1.0 + r['distance']) for r in results])
+        
+        # 归一化分数
+        if f.max() > f.min():
+            f_normalized = (f - f.min()) / (f.max() - f.min())
+        else:
+            f_normalized = f
+        
+        if original_scores.max() > original_scores.min():
+            orig_normalized = (original_scores - original_scores.min()) / (original_scores.max() - original_scores.min())
+        else:
+            orig_normalized = original_scores
+        
+        # 融合分数：图传播分数 + 原始分数
+        beta = 0.6  # 图传播分数的权重
+        final_scores = beta * f_normalized + (1 - beta) * orig_normalized
+        
+        # Step 6: 根据最终分数重排序
+        sorted_indices = np.argsort(-final_scores)  # 降序排列
+        
+        # 构建重排序后的结果列表
+        reordered_results = []
+        for idx in sorted_indices:
+            result = results[idx].copy()
+            result['distance'] = float(1.0 - final_scores[idx])  # 更新距离为融合分数
+            reordered_results.append(result)
+        
+        return reordered_results
 
 
 def main():
     """
     启动GUI应用程序
     
-    自动定位上级目录中的image和test文件夹作为数据库和测试集
+    从data文件夹中读取image和test数据集
     """
-    # 获取当前脚本所在目录和项目根目录
+    # 获取当前脚本所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    base_dir = os.path.dirname(script_dir)
+    data_dir = os.path.join(script_dir, "data")
     
     # 创建主窗口并启动应用
     root = tk.Tk()
-    ImageSearchApp(root, os.path.join(base_dir, "image"), os.path.join(base_dir, "test"))
+    ImageSearchApp(root, os.path.join(data_dir, "image"), os.path.join(data_dir, "test"))
     root.mainloop()  # 进入Tkinter事件循环
 
 
