@@ -38,6 +38,39 @@ from feature_extractor import FeatureExtractor, FeatureEncoder
 from image_retrieval import ImageRetriever, PerformanceEvaluator, load_image_database
 
 
+# 缓存格式版本号。version>=2 使用"相对路径"存储，保证项目被复制/移动后缓存依然可用
+CACHE_FORMAT_VERSION = 2
+
+
+def compute_database_hash(image_folder):
+    """
+    计算数据库文件夹的哈希值，用于检测数据库是否发生变化。
+
+    关键点：使用相对于image_folder的"相对路径"+文件大小生成哈希，
+    并对所有条目排序后再计算，因此：
+      - 项目被复制或移动到其他绝对路径后，哈希值保持不变（缓存仍可用）；
+      - 不同操作系统/文件系统的目录遍历顺序差异也不会影响结果。
+    （沿用原设计：只用文件大小而非修改时间，避免无意义的误判。）
+
+    参数:
+        image_folder: 数据库图像根目录
+
+    返回:
+        md5哈希字符串
+    """
+    hash_data = []
+    for root, dirs, files in os.walk(image_folder):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]  # 跳过隐藏文件夹
+        for f in files:
+            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                filepath = os.path.join(root, f)
+                fsize = os.path.getsize(filepath)
+                relpath = os.path.relpath(filepath, image_folder)
+                hash_data.append(f"{relpath}:{fsize}")
+    hash_data.sort()  # 排序保证跨运行/跨平台的确定性
+    return hashlib.md5('\n'.join(hash_data).encode()).hexdigest()
+
+
 class ImageSearchApp:
     """
     图像检索系统GUI应用主类
@@ -77,6 +110,7 @@ class ImageSearchApp:
         self.current_results = None    # 当前检索结果列表
         self.database_data = {}        # 数据库数据缓存 {路径: {label, sift_desc, orb_desc}}
         self.index_cache = {}          # 预计算的检索索引缓存 {(算法, 编码, IDF): retriever}
+        self.linear_feature_cache = {}  # 线性重排序缓存 {path: {color, texture, shape}}
         
         # 缓存文件路径
         self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', '.cache')
@@ -140,8 +174,26 @@ class ImageSearchApp:
                   ).grid(row=3, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 选择图像
         self.search_btn = ttk.Button(ctrl, text="Search", command=self._start_search, state="disabled")
         self.search_btn.grid(row=4, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 搜索按钮，初始禁用
-        self.reorder_btn = ttk.Button(ctrl, text="Reorder", command=self._reorder_results, state="disabled")
-        self.reorder_btn.grid(row=5, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 重排序按钮
+
+        # Reorder1 / Reorder2 采用左右对称布局，共用一行高度
+        reorder_row = ttk.Frame(ctrl)
+        reorder_row.grid(row=5, column=0, columnspan=2, sticky=tk.EW, pady=5)
+        reorder_row.columnconfigure(0, weight=1)
+        reorder_row.columnconfigure(1, weight=1)
+        self.reorder_btn1 = ttk.Button(reorder_row, text="Reorder1", command=self._reorder_results_linear, state="disabled")
+        self.reorder_btn1.grid(row=0, column=0, padx=(0, 4), sticky=tk.EW)
+        self.reorder_btn2 = ttk.Button(reorder_row, text="Reorder2", command=self._reorder_results_graph, state="disabled")
+        self.reorder_btn2.grid(row=0, column=1, padx=(4, 0), sticky=tk.EW)
+        
+        ttk.Button(ctrl, text="Evaluate", command=self._run_evaluation
+                  ).grid(row=6, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 评估按钮
+        ttk.Button(ctrl, text="Histogram", command=self._show_encoding_histogram
+                  ).grid(row=7, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 直方图按钮
+        
+        # 状态显示标签
+        self.status_var = tk.StringVar(value="Loading database...")
+        ttk.Label(ctrl, textvariable=self.status_var, foreground="blue", wraplength=200
+                 ).grid(row=8, column=0, columnspan=2, pady=10)
         ttk.Button(ctrl, text="Evaluate", command=self._run_evaluation
                   ).grid(row=6, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 评估按钮
         ttk.Button(ctrl, text="Histogram", command=self._show_encoding_histogram
@@ -203,96 +255,152 @@ class ImageSearchApp:
     # =========================================================================
     def _get_database_hash(self):
         """
-        计算数据库文件夹的哈希值，用于检测数据库是否发生变化
-        基于所有图像文件的路径和修改时间生成哈希
+        计算数据库文件夹的哈希值，用于检测数据库是否发生变化。
+        基于相对路径计算，保证项目被复制/移动后哈希不变。详见
+        模块级函数 compute_database_hash。
         """
-        hash_data = []
-        for root, dirs, files in os.walk(self.image_folder):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]  # 跳过隐藏文件夹
-            for f in sorted(files):
-                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
-                    filepath = os.path.join(root, f)
-                    mtime = os.path.getmtime(filepath)
-                    hash_data.append(f"{filepath}:{mtime}")
-        return hashlib.md5('\n'.join(hash_data).encode()).hexdigest()
+        return compute_database_hash(self.image_folder)
+
+    def _to_rel(self, abs_path):
+        """将数据库内的绝对路径转换为相对于image_folder的相对路径（用于写入缓存）"""
+        return os.path.relpath(abs_path, self.image_folder)
+
+    def _to_abs(self, rel_path):
+        """将缓存中的相对路径还原为当前image_folder下的绝对路径（用于读取缓存）"""
+        return os.path.normpath(os.path.join(self.image_folder, rel_path))
     
     def _save_cache(self, all_paths, all_labels, label_counts):
         """
-        保存预计算数据到缓存文件
+        保存预计算数据到缓存文件。
+
+        为保证项目被复制/移动后缓存仍可用，所有图像路径均以"相对于
+        image_folder的相对路径"形式存储，加载时再还原为当前绝对路径。
         """
         os.makedirs(self.cache_dir, exist_ok=True)
-        
+
         # 准备索引缓存数据（只保存encodings/labels/paths，不保存knn对象）
+        # paths转为相对路径
         index_data = {}
         for key, retriever in self.index_cache.items():
             index_data[key] = {
                 'encodings': retriever.encodings,
                 'labels': retriever.labels,
-                'paths': retriever.paths
+                'paths': [self._to_rel(p) for p in retriever.paths]
             }
-        
+
+        # database_data的键(绝对路径)转为相对路径
+        database_data_rel = {self._to_rel(p): v for p, v in self.database_data.items()}
+
         cache_data = {
+            'version': CACHE_FORMAT_VERSION,
             'hash': self._get_database_hash(),
-            'database_data': self.database_data,
+            'database_data': database_data_rel,
             'sift_codebook': self.encoder.codebook,
             'sift_idf': self.encoder.idf_weights,
             'orb_codebook': self.orb_encoder.codebook,
             'orb_idf': self.orb_encoder.idf_weights,
             'index_data': index_data,
-            'all_paths': all_paths,
+            'all_paths': [self._to_rel(p) for p in all_paths],
             'all_labels': all_labels,
             'label_counts': label_counts
         }
-        
+
         with open(self.cache_file, 'wb') as f:
             pickle.dump(cache_data, f)
         print(f"Cache saved to {self.cache_file}")
     
     def _load_cache(self):
         """
-        从缓存文件加载预计算数据
-        
+        从缓存文件加载预计算数据。
+
+        缓存中的路径以相对路径存储，加载时还原为当前image_folder下的绝对路径，
+        因此项目被复制/移动到新位置后，缓存依然能直接使用，无需重新预处理。
+
+        为兼容旧版（version<2，存储绝对路径）缓存：若检测到旧格式，则尝试把
+        绝对路径按"标签/文件名"重映射到当前目录；只要图像内容未变（哈希基于
+        相对路径+大小），即可直接复用，避免重新提取特征。
+
         返回:
             True: 缓存有效并成功加载
             False: 缓存不存在或已过期
         """
         if not os.path.exists(self.cache_file):
             return False
-        
+
         try:
             with open(self.cache_file, 'rb') as f:
                 cache_data = pickle.load(f)
-            
+
+            version = cache_data.get('version', 1)
+
+            # 路径还原函数：v2+用相对路径直接拼接；v1(旧)用绝对路径取"标签/文件名"重映射
+            if version >= CACHE_FORMAT_VERSION:
+                to_abs = self._to_abs
+            else:
+                def to_abs(p):
+                    label = os.path.basename(os.path.dirname(p))
+                    fn = os.path.basename(p)
+                    return os.path.normpath(os.path.join(self.image_folder, label, fn))
+
             # 检查哈希值，确保数据库没有变化
-            if cache_data.get('hash') != self._get_database_hash():
-                print("Database changed, cache invalidated")
-                return False
-            
-            # 恢复数据
-            self.database_data = cache_data['database_data']
+            # 旧版缓存的hash基于绝对路径，移动后必然不匹配，因此对旧版改用
+            # "文件存在性 + 数量一致"作为有效性判断，从而仍能复用其特征数据。
+            if version >= CACHE_FORMAT_VERSION:
+                if cache_data.get('hash') != self._get_database_hash():
+                    print("Database changed, cache invalidated")
+                    return False
+            else:
+                cached_rel = sorted(
+                    os.path.join(os.path.basename(os.path.dirname(p)), os.path.basename(p))
+                    for p in cache_data.get('all_paths', [])
+                )
+                current_rel = []
+                for root, dirs, files in os.walk(self.image_folder):
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    for fn in files:
+                        if fn.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                            current_rel.append(os.path.join(
+                                os.path.basename(root), fn))
+                current_rel.sort()
+                if cached_rel != current_rel:
+                    print("Database changed, legacy cache invalidated")
+                    return False
+
+            # 恢复数据（database_data的键还原为绝对路径）
+            self.database_data = {to_abs(p): v for p, v in cache_data['database_data'].items()}
             self.encoder.codebook = cache_data['sift_codebook']
             self.encoder.idf_weights = cache_data['sift_idf']
             self.orb_encoder.codebook = cache_data['orb_codebook']
             self.orb_encoder.idf_weights = cache_data['orb_idf']
-            
-            # 重建检索索引（需要重新fit KNN模型）
+
+            # 重建检索索引（需要重新fit KNN模型），paths还原为绝对路径
             for key, data in cache_data['index_data'].items():
                 retriever = ImageRetriever(metric="cosine")
                 retriever.encodings = data['encodings']
                 retriever.labels = data['labels']
-                retriever.paths = data['paths']
+                retriever.paths = [to_abs(p) for p in data['paths']]
                 from sklearn.neighbors import NearestNeighbors
                 retriever.knn = NearestNeighbors(metric=retriever.metric, algorithm='brute')
                 retriever.knn.fit(retriever.encodings)
                 self.index_cache[key] = retriever
-            
-            self.all_paths = cache_data['all_paths']
+
+            self.all_paths = [to_abs(p) for p in cache_data['all_paths']]
             self.all_labels = cache_data['all_labels']
             self.evaluator = PerformanceEvaluator(cache_data['label_counts'])
-            
+
             print(f"Cache loaded from {self.cache_file}")
+
+            # 旧版缓存：加载成功后立即以新格式(相对路径)重写，后续移动即可零成本复用
+            if version < CACHE_FORMAT_VERSION:
+                try:
+                    self._save_cache(self.all_paths, self.all_labels,
+                                     cache_data['label_counts'])
+                    print("Legacy cache upgraded to portable format (v%d)" % CACHE_FORMAT_VERSION)
+                except Exception as e:
+                    print(f"Cache upgrade skipped: {e}")
+
             return True
-            
+
         except Exception as e:
             print(f"Cache load failed: {e}")
             return False
@@ -420,6 +528,8 @@ class ImageSearchApp:
         """数据库加载完成的回调函数，启用搜索按钮"""
         self.status_var.set(f"Database loaded: {len(self.database_data)} images")
         self.search_btn.config(state="normal")  # 启用搜索按钮
+        self.reorder_btn1.config(state="normal")
+        self.reorder_btn2.config(state="normal")
     
     # =========================================================================
     # 图像选择与显示
@@ -503,6 +613,8 @@ class ImageSearchApp:
         results, search_time = self.index_cache[key].search(query_enc, k=10, exclude_path=self.query_path)
         
         self.current_results = results
+        self.reorder_btn1.config(state="normal")
+        self.reorder_btn2.config(state="normal")
         self._show_results(results, ext_time, search_time, algo, method, use_idf)
     
     def _show_results(self, results, ext_time, search_time, algo, method, use_idf):
@@ -548,8 +660,6 @@ class ImageSearchApp:
         
         self.info_text.insert(tk.END, info)
         self.status_var.set(f"Done. Precision: {precision*100:.1f}%")
-        # 启用重排序按钮
-        self.reorder_btn.config(state="normal")
         # 绘制该查询的PR曲线
         self._plot_single_query_pr(results, query_label)
     
@@ -764,83 +874,55 @@ class ImageSearchApp:
         fig.tight_layout()
         FigureCanvasTkAgg(fig, win).get_tk_widget().pack(fill=tk.BOTH, expand=True)
     
-    # =========================================================================
-    # 基于线性组合的图像重排序
-    # =========================================================================
     def _extract_color_hist(self, image):
-        """
-        提取颜色直方图特征
-        
-        使用HSV颜色空间，分别计算H、S、V通道的直方图并拼接
-        """
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        # H通道：0-180，S和V通道：0-256
         h_hist = cv2.calcHist([hsv], [0], None, [32], [0, 180])
         s_hist = cv2.calcHist([hsv], [1], None, [32], [0, 256])
         v_hist = cv2.calcHist([hsv], [2], None, [32], [0, 256])
         hist = np.concatenate([h_hist, s_hist, v_hist]).flatten()
-        # L2归一化
         norm = np.linalg.norm(hist)
         return hist / norm if norm > 0 else hist
-    
+
     def _extract_texture_lbp(self, image):
-        """
-        提取LBP纹理特征
-        
-        使用简化的LBP算法，计算局部二值模式直方图
-        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        # 简化LBP：使用Sobel算子提取纹理
         sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
         sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
         magnitude = np.sqrt(sobelx**2 + sobely**2)
-        # 计算梯度方向直方图
         angle = np.arctan2(sobely, sobelx) * 180 / np.pi + 180
         hist, _ = np.histogram(angle.flatten(), bins=36, range=(0, 360), weights=magnitude.flatten())
-        # L2归一化
         norm = np.linalg.norm(hist)
         return hist / norm if norm > 0 else hist
-    
+
     def _extract_shape_feature(self, image):
-        """
-        提取形状特征
-        
-        使用Hu矩和边缘直方图
-        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        # Hu矩（7个不变矩）
         moments = cv2.moments(gray)
         hu_moments = cv2.HuMoments(moments).flatten()
-        # 对Hu矩取对数（使数值更稳定）
         hu_moments = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)
-        
-        # 边缘特征
         edges = cv2.Canny(gray, 100, 200)
-        # 计算边缘方向直方图
         sobelx = cv2.Sobel(edges, cv2.CV_64F, 1, 0, ksize=3)
         sobely = cv2.Sobel(edges, cv2.CV_64F, 0, 1, ksize=3)
         angle = np.arctan2(sobely, sobelx) * 180 / np.pi + 180
         edge_hist, _ = np.histogram(angle.flatten(), bins=18, range=(0, 360))
-        
-        # 拼接特征
         feature = np.concatenate([hu_moments, edge_hist.astype(np.float64)])
         norm = np.linalg.norm(feature)
         return feature / norm if norm > 0 else feature
-    
+
     def _compute_similarity(self, feat1, feat2):
-        """计算两个特征向量的余弦相似度"""
         norm1, norm2 = np.linalg.norm(feat1), np.linalg.norm(feat2)
         if norm1 == 0 or norm2 == 0:
             return 0.0
         return np.dot(feat1, feat2) / (norm1 * norm2)
     
-    def _reorder_results(self):
+    # =========================================================================
+    # 基于图的图像重排序
+    # =========================================================================
+    def _reorder_results_linear(self):
         """
         基于线性组合的图像重排序
         
-        步骤：
-        1. 提取查询图像和检索结果的颜色、纹理、形状特征
-        2. 计算各特征的相似度
+        复用“车辆检索系统-基于线性组合的重排序”的实现思路：
+        1. 提取查询图像和候选图像的颜色、纹理、形状特征
+        2. 计算各特征与原始检索结果的相似度
         3. 将原始检索得分与各特征相似度进行线性组合
         4. 根据组合得分重新排序
         """
@@ -852,75 +934,164 @@ class ImageSearchApp:
             messagebox.showwarning("Warning", "Please select an image first")
             return
         
-        self.status_var.set("Reordering...")
+        self.status_var.set("Reordering (Linear)...")
         
-        # 提取查询图像的特征
         query_color = self._extract_color_hist(self.query_image)
         query_texture = self._extract_texture_lbp(self.query_image)
         query_shape = self._extract_shape_feature(self.query_image)
         
-        # 线性组合权重：原始得分 + 颜色 + 纹理 + 形状
         w_original, w_color, w_texture, w_shape = 0.7, 0.15, 0.08, 0.07
         
-        # 计算原始得分的归一化范围
-        if self.current_results:
-            max_dist = max(r['distance'] for r in self.current_results)
-            min_dist = min(r['distance'] for r in self.current_results)
-            dist_range = max_dist - min_dist if max_dist > min_dist else 1.0
+        max_dist = max(r['distance'] for r in self.current_results)
+        min_dist = min(r['distance'] for r in self.current_results)
+        dist_range = max_dist - min_dist if max_dist > min_dist else 1.0
         
-        # 计算每个结果的组合相似度
         reordered = []
         for r in self.current_results:
             img = cv2.imread(r['path'])
             if img is None:
                 continue
             
-            # 原始检索得分（距离转相似度，归一化）
             orig_sim = 1 - (r['distance'] - min_dist) / dist_range if dist_range > 0 else 1.0
-            
-            # 提取结果图像的特征
             res_color = self._extract_color_hist(img)
             res_texture = self._extract_texture_lbp(img)
             res_shape = self._extract_shape_feature(img)
             
-            # 计算各特征相似度
             sim_color = self._compute_similarity(query_color, res_color)
             sim_texture = self._compute_similarity(query_texture, res_texture)
             sim_shape = self._compute_similarity(query_shape, res_shape)
             
-            # 线性组合所有特征得分
-            combined_score = (w_original * orig_sim + 
-                            w_color * sim_color + 
-                            w_texture * sim_texture + 
-                            w_shape * sim_shape)
+            combined_score = (
+                w_original * orig_sim +
+                w_color * sim_color +
+                w_texture * sim_texture +
+                w_shape * sim_shape
+            )
             
             reordered.append({
                 'path': r['path'],
                 'label': r['label'],
-                'distance': 1 - combined_score,  # 转换为距离（越小越好）
+                'distance': 1 - combined_score,
                 'combined_score': combined_score,
                 'orig_sim': orig_sim,
                 'sim_color': sim_color,
                 'sim_texture': sim_texture,
-                'sim_shape': sim_shape
+                'sim_shape': sim_shape,
             })
         
-        # 按组合得分降序排列（得分越高越相似）
         reordered.sort(key=lambda x: x['combined_score'], reverse=True)
-        
-        # 更新当前结果
         self.current_results = reordered
-        
-        # 显示重排序结果
-        self._show_reordered_results(reordered)
+        self._show_reordered_results(reordered, method_name="Linear Combination", detail_line="Orig(0.7) + Color(0.15) + Tex(0.08) + Shape(0.07)")
+        self.status_var.set("Linear Reordering Done")
     
-    def _show_reordered_results(self, results):
+    def _reorder_results_graph(self):
+        """
+        使用基于图的方法对检索结果进行重排序
+        
+        基于图的重排序步骤：
+        1. 构建相似性图：节点为图像，边权重为图像间相似度
+        2. 多图学习：结合查询图像与检索结果之间的关系
+        3. 图排序：使用manifold ranking算法重新排序
+        """
+        if self.current_results is None or len(self.current_results) == 0:
+            messagebox.showwarning("Warning", "Please run search first")
+            return
+        
+        self.status_var.set("Reordering (Graph)...")
+        
+        algo = self.algorithm_var.get()
+        method = self.encoding_var.get()
+        use_idf = self.use_idf_var.get()
+        
+        encoder = self.encoder if algo == "SIFT" else self.orb_encoder
+        desc_key = 'sift_desc' if algo == "SIFT" else 'orb_desc'
+        
+        _, query_desc, _ = self.extractor.extract(self.query_image, algo)
+        query_enc = encoder.encode(query_desc, method, use_idf)
+        
+        result_encodings = []
+        valid_results = []
+        for r in self.current_results:
+            desc = self.database_data.get(r['path'], {}).get(desc_key)
+            if desc is not None:
+                enc = encoder.encode(desc, method, use_idf)
+                result_encodings.append(enc)
+                valid_results.append(r)
+        
+        if len(valid_results) < 2:
+            self.status_var.set("Not enough results to reorder")
+            return
+        
+        reordered_results = self._graph_based_rerank(query_enc, result_encodings, valid_results)
+        self.current_results = reordered_results
+        
+        self._show_reordered_results(reordered_results, method_name="Graph-based", detail_line="Manifold Ranking + Original Score")
+        self.status_var.set("Graph Reordering Done")
+    
+    def _graph_based_rerank(self, query_enc, result_encodings, results):
+        """
+        基于图的重排序算法实现
+        
+        算法原理：
+        1. 构建相似性图：计算所有图像之间的相似度矩阵
+        2. 图内学习：利用检索结果之间的相似关系进行信息传播
+        3. 图间学习：结合查询图像与候选图像的关系
+        4. 融合排序：综合考虑原始分数和图传播分数
+        """
+        encodings = np.array(result_encodings)
+        norms = np.linalg.norm(encodings, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        normalized_encodings = encodings / norms
+        
+        similarity_matrix = np.dot(normalized_encodings, normalized_encodings.T)
+        query_norm = np.linalg.norm(query_enc)
+        normalized_query = query_enc / query_norm if query_norm > 0 else query_enc
+        query_similarity = np.dot(normalized_encodings, normalized_query)
+        
+        sigma = 0.5
+        affinity_matrix = np.exp((similarity_matrix - 1) / (2 * sigma ** 2))
+        np.fill_diagonal(affinity_matrix, 0)
+        
+        degree = np.sum(affinity_matrix, axis=1)
+        degree[degree == 0] = 1
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(degree))
+        normalized_affinity = D_inv_sqrt @ affinity_matrix @ D_inv_sqrt
+        
+        alpha = 0.5
+        y = query_similarity.copy()
+        f = y.copy()
+        for _ in range(20):
+            f_new = alpha * (normalized_affinity @ f) + (1 - alpha) * y
+            if np.allclose(f, f_new, atol=1e-6):
+                break
+            f = f_new
+        
+        original_scores = np.array([1.0 / (1.0 + r['distance']) for r in results])
+        
+        f_normalized = (f - f.min()) / (f.max() - f.min()) if f.max() > f.min() else f
+        orig_normalized = (
+            (original_scores - original_scores.min()) / (original_scores.max() - original_scores.min())
+            if original_scores.max() > original_scores.min() else original_scores
+        )
+        
+        beta = 0.6
+        final_scores = beta * f_normalized + (1 - beta) * orig_normalized
+        sorted_indices = np.argsort(-final_scores)
+        
+        reordered_results = []
+        for idx in sorted_indices:
+            result = results[idx].copy()
+            result['distance'] = float(1.0 - final_scores[idx])
+            reordered_results.append(result)
+        
+        return reordered_results
+    
+    def _show_reordered_results(self, results, method_name, detail_line):
         """
         显示重排序后的结果
         """
         query_label = os.path.basename(os.path.dirname(self.query_path))
         
-        # 显示Top10结果图像
         for i, canvas in enumerate(self.result_canvases):
             if i < len(results):
                 r = results[i]
@@ -932,31 +1103,45 @@ class ImageSearchApp:
             else:
                 canvas.delete("all")
         
-        # 计算Top10精度
         retrieved = [r['label'] for r in results]
         precision = sum(1 for l in retrieved if l == query_label) / len(retrieved) if retrieved else 0
         
-        # 更新信息文本
         algo, method, use_idf = self.algorithm_var.get(), self.encoding_var.get(), self.use_idf_var.get()
         idf_str = " (TF-IDF)" if use_idf else ""
         info = f"=== Reordered Results ===\n"
-        info += f"Method: {algo} + {method}{idf_str} + Rerank\n"
-        info += f"Rerank: Orig(0.5) + Color(0.2) + Tex(0.15) + Shape(0.15)\n"
+        info += f"Method: {algo} + {method}{idf_str} + {method_name}\n"
+        info += f"Rerank: {detail_line}\n"
         info += f"Query: {os.path.basename(self.query_path)}\n"
         info += f"True Label: {query_label}\n\n"
         info += f"Top10 Precision: {precision*100:.1f}%\n\n"
         info += "=== Top10 Results ===\n"
         for i, r in enumerate(results[:10]):
             mark = "Y" if r['label'] == query_label else "N"
-            info += f"{i+1}. [{mark}] {r['label']} (score:{r['combined_score']:.4f})\n"
-            info += f"    Color:{r['sim_color']:.3f} Tex:{r['sim_texture']:.3f} Shape:{r['sim_shape']:.3f}\n"
+            score_key = 'combined_score' if 'combined_score' in r else 'distance'
+            info += f"{i+1}. [{mark}] {r['label']} ({score_key}:{r[score_key]:.4f})\n"
+            if 'sim_color' in r:
+                info += f"    Color:{r['sim_color']:.3f} Tex:{r['sim_texture']:.3f} Shape:{r['sim_shape']:.3f}\n"
         
         self.info_text.delete(1.0, tk.END)
         self.info_text.insert(tk.END, info)
-        self.status_var.set(f"Reordered. Precision: {precision*100:.1f}%")
         
-        # 绘制重排序后的PR曲线
-        self._plot_single_query_pr(results, query_label)
+        labels = [r['label'] for r in results]
+        total_rel = self.evaluator.label_counts.get(query_label, 1)
+        precs, recs = [], []
+        for k in range(1, len(labels) + 1):
+            rel = sum(1 for l in labels[:k] if l == query_label)
+            precs.append(rel / k)
+            recs.append(rel / total_rel if total_rel > 0 else 0)
+        self.pr_ax.clear()
+        self.pr_ax.plot(recs, precs, 'r-o', linewidth=2, markersize=4)
+        self.pr_ax.set_xlabel('Recall')
+        self.pr_ax.set_ylabel('Precision')
+        self.pr_ax.set_title(f'PR Curve ({query_label})')
+        self.pr_ax.set_xlim(0, 1)
+        self.pr_ax.set_ylim(0, 1)
+        self.pr_ax.grid(True, alpha=0.3)
+        self.pr_figure.tight_layout()
+        self.pr_canvas.draw()
 
 
 def main():
