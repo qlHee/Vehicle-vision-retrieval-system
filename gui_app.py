@@ -108,6 +108,7 @@ class ImageSearchApp:
         self.query_image = None        # 当前查询图像（numpy数组）
         self.query_path = None         # 当前查询图像路径
         self.current_results = None    # 当前检索结果列表
+        self.query_expanded = False    # 是否已执行Query Expansion
         self.database_data = {}        # 数据库数据缓存 {路径: {label, sift_desc, orb_desc}}
         self.index_cache = {}          # 预计算的检索索引缓存 {(算法, 编码, IDF): retriever}
         self.linear_feature_cache = {}  # 线性重排序缓存 {path: {color, texture, shape}}
@@ -146,7 +147,7 @@ class ImageSearchApp:
         top.pack_propagate(False)  # 禁止子控件改变父容器大小
         
         # 查询图像显示区域（左侧）
-        qf = ttk.LabelFrame(top, text="Query Image", padding=5, width=380)
+        qf = ttk.LabelFrame(top, text="Query Image", padding=5, width=362)
         qf.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         qf.pack_propagate(False)
         self.query_canvas = tk.Canvas(qf, bg="white")  # 用Canvas显示图像
@@ -157,27 +158,55 @@ class ImageSearchApp:
         ctrl.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         ctrl.pack_propagate(False)
         
-        # 特征算法下拉框：SIFT或ORB
-        ttk.Label(ctrl, text="Feature:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        ttk.Combobox(ctrl, textvariable=self.algorithm_var, values=["SIFT", "ORB"], 
-                    state="readonly", width=12).grid(row=0, column=1, pady=5)
-        # 编码方法下拉框：BoF或VLAD
-        ttk.Label(ctrl, text="Encoding:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        ttk.Combobox(ctrl, textvariable=self.encoding_var, values=["BoF", "VLAD"], 
-                    state="readonly", width=12).grid(row=1, column=1, pady=5)
-        # TF-IDF开关复选框
-        ttk.Checkbutton(ctrl, text="Enable TF-IDF", variable=self.use_idf_var
-                       ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=5)
+        # 特征算法双选框：默认SIFT，勾选ORB后SIFT自动取消
+        ttk.Label(ctrl, text="Feature:").grid(row=0, column=0, sticky=tk.W, pady=(0, 2))
+        feature_row = ttk.Frame(ctrl)
+        feature_row.grid(row=0, column=1, sticky=tk.W, pady=(0, 2))
+        self.feature_sift_var = tk.BooleanVar(value=True)
+        self.feature_orb_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(feature_row, text="SIFT", variable=self.feature_sift_var,
+                        command=self._on_feature_toggle).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(feature_row, text="ORB", variable=self.feature_orb_var,
+                        command=self._on_feature_toggle).pack(side=tk.LEFT)
+        # 编码方法双选框：默认BoF，勾选VLAD后BoF自动取消
+        ttk.Label(ctrl, text="Encoding:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        encoding_row = ttk.Frame(ctrl)
+        encoding_row.grid(row=1, column=1, sticky=tk.W, pady=2)
+        self.encoding_bof_var = tk.BooleanVar(value=True)
+        self.encoding_vlad_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(encoding_row, text="BoF ", variable=self.encoding_bof_var,
+                        command=self._on_encoding_toggle).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(encoding_row, text="VLAD", variable=self.encoding_vlad_var,
+                        command=self._on_encoding_toggle).pack(side=tk.LEFT)
+        # TF-IDF开关复选框 + Evaluate按钮同一行
+        tfidf_eval_row = ttk.Frame(ctrl)
+        tfidf_eval_row.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=1)
+        tfidf_eval_row.columnconfigure(0, weight=1)
+        tfidf_eval_row.columnconfigure(1, weight=1)
+        ttk.Checkbutton(tfidf_eval_row, text="Enable TF-IDF", variable=self.use_idf_var
+                       ).grid(row=0, column=0, sticky=tk.W)
+        ttk.Button(tfidf_eval_row, text="Evaluate", command=self._run_evaluation
+                  ).grid(row=0, column=1, sticky=tk.EW, padx=(8, 0))
+        
+        # 分割线：
+        ttk.Separator(ctrl, orient="horizontal").grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=8)
         
         # 功能按钮
         ttk.Button(ctrl, text="Select Image", command=self._select_image
-                  ).grid(row=3, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 选择图像
+                  ).grid(row=4, column=0, columnspan=2, pady=2, sticky=tk.EW)  # 选择图像
         self.search_btn = ttk.Button(ctrl, text="Search", command=self._start_search, state="disabled")
-        self.search_btn.grid(row=4, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 搜索按钮，初始禁用
+        self.search_btn.grid(row=5, column=0, columnspan=2, pady=1, sticky=tk.EW)  # 搜索按钮，初始禁用
 
+        ttk.Button(ctrl, text="Histogram", command=self._show_encoding_histogram
+                  ).grid(row=6, column=0, columnspan=2, pady=2, sticky=tk.EW)  # 直方图按钮
+        
+
+        # 分割线：
+        ttk.Separator(ctrl, orient="horizontal").grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=10)
+                
         # Reorder1 / Reorder2 采用左右对称布局，共用一行高度
         reorder_row = ttk.Frame(ctrl)
-        reorder_row.grid(row=5, column=0, columnspan=2, sticky=tk.EW, pady=5)
+        reorder_row.grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=3)
         reorder_row.columnconfigure(0, weight=1)
         reorder_row.columnconfigure(1, weight=1)
         self.reorder_btn1 = ttk.Button(reorder_row, text="Reorder1", command=self._reorder_results_linear, state="disabled")
@@ -185,24 +214,23 @@ class ImageSearchApp:
         self.reorder_btn2 = ttk.Button(reorder_row, text="Reorder2", command=self._reorder_results_graph, state="disabled")
         self.reorder_btn2.grid(row=0, column=1, padx=(4, 0), sticky=tk.EW)
         
-        ttk.Button(ctrl, text="Evaluate", command=self._run_evaluation
-                  ).grid(row=6, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 评估按钮
-        ttk.Button(ctrl, text="Histogram", command=self._show_encoding_histogram
-                  ).grid(row=7, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 直方图按钮
-        
+        qe_row = ttk.Frame(ctrl)
+        qe_row.grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=1)
+        qe_row.columnconfigure(2, weight=1)
+        ttk.Label(qe_row, text="top").grid(row=0, column=0, padx=(0, 2))
+        self.qe_k_var = tk.IntVar(value=5)
+        ttk.Combobox(qe_row, textvariable=self.qe_k_var, values=list(range(1, 11)),
+                     width=3, state="readonly").grid(row=0, column=1, padx=(0, 4))
+        self.qe_btn = ttk.Button(qe_row, text="Query Expansion", command=self._query_expansion, state="disabled")
+        self.qe_btn.grid(row=0, column=2, sticky=tk.EW)
+
+        # 分割线：
+        ttk.Separator(ctrl, orient="horizontal").grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=(10,3))
+          
         # 状态显示标签
         self.status_var = tk.StringVar(value="Loading database...")
-        ttk.Label(ctrl, textvariable=self.status_var, foreground="blue", wraplength=200
-                 ).grid(row=8, column=0, columnspan=2, pady=10)
-        ttk.Button(ctrl, text="Evaluate", command=self._run_evaluation
-                  ).grid(row=6, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 评估按钮
-        ttk.Button(ctrl, text="Histogram", command=self._show_encoding_histogram
-                  ).grid(row=7, column=0, columnspan=2, pady=5, sticky=tk.EW)  # 直方图按钮
-        
-        # 状态显示标签
-        self.status_var = tk.StringVar(value="Loading database...")
-        ttk.Label(ctrl, textvariable=self.status_var, foreground="blue", wraplength=200
-                 ).grid(row=8, column=0, columnspan=2, pady=10)
+        ttk.Label(ctrl, textvariable=self.status_var, foreground="white", wraplength=200
+                 ).grid(row=11, column=0, columnspan=2, pady=3)
         
         # PR曲线显示区域（右侧）- 先pack以确保显示
         prf = ttk.LabelFrame(top, text="PR Curve", padding=5, width=360)
@@ -230,16 +258,58 @@ class ImageSearchApp:
         rf = ttk.LabelFrame(main, text="Search Results (Top 10)", padding=5)
         rf.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
         
-        # 创建10个Canvas用于显示检索结果图像
+        # 创建10个结果槽位，每个槽位包含左侧勾选框+序号车牌号，右侧图像
         self.result_canvases = []
+        self.result_vars = []
+        self.result_label_vars = []
+        self.result_label_widgets = []
         for row in range(2):
             row_frame = ttk.Frame(rf)
             row_frame.pack(fill=tk.X, pady=2, expand=True)
             for _ in range(5):
-                canvas = tk.Canvas(row_frame, width=220, height=200, bg="lightgray")
-                canvas.pack(side=tk.LEFT, padx=5, expand=True)
+                item_frame = ttk.Frame(row_frame)
+                item_frame.pack(side=tk.LEFT, padx=18, expand=False, fill=tk.BOTH)
+
+                left_panel = ttk.Frame(item_frame, width=50)
+                left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 2))
+                left_panel.pack_propagate(False)
+
+                var = tk.BooleanVar(value=False)
+                ttk.Checkbutton(left_panel, variable=var).pack(anchor=tk.W, pady=(6, 1))
+
+                label_var = tk.StringVar(value="")
+                lbl = tk.Label(left_panel, textvariable=label_var, justify=tk.LEFT, anchor="w",
+                               wraplength=100, font=('Arial', 9, 'bold'))
+                lbl.pack(anchor=tk.W, fill=tk.X)
+
+                canvas = tk.Canvas(item_frame, width=185, height=185, bg="lightgray", highlightthickness=0)
+                canvas.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
                 self.result_canvases.append(canvas)
+                self.result_vars.append(var)
+                self.result_label_vars.append(label_var)
+                self.result_label_widgets.append(lbl)
     
+    def _on_feature_toggle(self):
+        """Feature单选式切换：SIFT/ORB互斥，默认至少保留一个。"""
+        if self.feature_orb_var.get():
+            self.feature_sift_var.set(False)
+        if not self.feature_sift_var.get() and not self.feature_orb_var.get():
+            self.feature_sift_var.set(True)
+
+    def _on_encoding_toggle(self):
+        """Encoding单选式切换：BoF/VLAD互斥，默认至少保留一个。"""
+        if self.encoding_vlad_var.get():
+            self.encoding_bof_var.set(False)
+        if not self.encoding_bof_var.get() and not self.encoding_vlad_var.get():
+            self.encoding_bof_var.set(True)
+
+    def _get_selected_feature(self):
+        return "ORB" if self.feature_orb_var.get() else "SIFT"
+
+    def _get_selected_encoding(self):
+        return "VLAD" if self.encoding_vlad_var.get() else "BoF"
+
     def _init_pr_plot(self):
         """初始化空的PR曲线图"""
         self.pr_ax.set_xlabel('Recall')
@@ -528,6 +598,7 @@ class ImageSearchApp:
         """数据库加载完成的回调函数，启用搜索按钮"""
         self.status_var.set(f"Database loaded: {len(self.database_data)} images")
         self.search_btn.config(state="normal")  # 启用搜索按钮
+        self.qe_btn.config(state="normal")
         self.reorder_btn1.config(state="normal")
         self.reorder_btn2.config(state="normal")
     
@@ -547,10 +618,15 @@ class ImageSearchApp:
             self.query_image = cv2.imread(path)  # 读取图像
             self.query_path = path
             self._display_image(self.query_image, self.query_canvas)  # 显示在查询区域
-            self.status_var.set(f"Selected: {os.path.basename(path)}")
+            self.status_var.set(f"{os.path.basename(path)}")
             # 清空结果显示区域
             for canvas in self.result_canvases:
                 canvas.delete("all")
+            for var in self.result_vars:
+                var.set(False)
+            for label_var, label_widget in zip(self.result_label_vars, self.result_label_widgets):
+                label_var.set("")
+                label_widget.config(foreground="black")
             self.info_text.delete(1.0, tk.END)
     
     def _display_image(self, cv_img, canvas, label=None):
@@ -572,21 +648,33 @@ class ImageSearchApp:
         # 获取Canvas尺寸，按比例缩放图像以适应
         canvas.update()
         w, h = canvas.winfo_width() or 220, canvas.winfo_height() or 200
-        pil_img.thumbnail((w - 4, h - 20 if label else h - 4), Image.Resampling.LANCZOS)
+        pil_img.thumbnail((w, h), Image.Resampling.LANCZOS)
         tk_img = ImageTk.PhotoImage(pil_img)
         
-        # 在Canvas上居中绘制图像
+        # 在Canvas左上角绘制图像，尽量贴边
         canvas.delete("all")
-        canvas.create_image((w - pil_img.width) // 2, 2, anchor=tk.NW, image=tk_img)
+        canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
         canvas.image = tk_img  # 保持引用，防止被垃圾回收
         
         # 如果有标签，在底部绘制文字
         if label:
-            canvas.create_text(w // 2, h - 10, text=label, font=('Arial', 8))
+            canvas.create_text(max(10, pil_img.width // 2), max(10, h - 8), text=label, font=('Arial', 8))
     
     # =========================================================================
     # 图像检索
     # =========================================================================
+    def _get_query_encoding(self, algo, method, use_idf, image=None):
+        """提取并编码查询图像。"""
+        image = image if image is not None else self.query_image
+        _, desc, ext_time = self.extractor.extract(image, algo)
+        encoder = self.encoder if algo == "SIFT" else self.orb_encoder
+        return encoder.encode(desc, method, use_idf), ext_time
+
+    def _search_with_encoding(self, query_enc, algo, method, use_idf, exclude_path=None, k=10):
+        """基于给定查询向量执行检索。"""
+        key = (algo, method, use_idf)
+        return self.index_cache[key].search(query_enc, k=k, exclude_path=exclude_path)
+
     def _start_search(self):
         """
         执行图像检索
@@ -601,22 +689,87 @@ class ImageSearchApp:
         self.info_text.delete(1.0, tk.END)
         
         # 获取用户选择的算法和编码方法
-        algo, method, use_idf = self.algorithm_var.get(), self.encoding_var.get(), self.use_idf_var.get()
+        algo, method, use_idf = self._get_selected_feature(), self._get_selected_encoding(), self.use_idf_var.get()
         
         # 提取查询图像的特征并编码（根据算法选择对应的编码器）
-        _, desc, ext_time = self.extractor.extract(self.query_image, algo)
-        encoder = self.encoder if algo == "SIFT" else self.orb_encoder
-        query_enc = encoder.encode(desc, method, use_idf)
+        query_enc, ext_time = self._get_query_encoding(algo, method, use_idf)
         
         # 使用预计算的索引进行检索
-        key = (algo, method, use_idf)
-        results, search_time = self.index_cache[key].search(query_enc, k=10, exclude_path=self.query_path)
+        results, search_time = self._search_with_encoding(query_enc, algo, method, use_idf, exclude_path=self.query_path, k=10)
         
         self.current_results = results
+        self.query_expanded = False
         self.reorder_btn1.config(state="normal")
         self.reorder_btn2.config(state="normal")
         self._show_results(results, ext_time, search_time, algo, method, use_idf)
     
+    def _expand_query_encoding(self, query_enc, results, algo, method, use_idf):
+        """基于查询图像和Top5结果执行Query Expansion。"""
+        if not results:
+            return query_enc
+
+        encoder = self.encoder if algo == "SIFT" else self.orb_encoder
+        desc_key = 'sift_desc' if algo == "SIFT" else 'orb_desc'
+        candidates = [query_enc]
+
+        for r in results[:5]:
+            desc = self.database_data.get(r['path'], {}).get(desc_key)
+            if desc is None:
+                continue
+            candidates.append(encoder.encode(desc, method, use_idf))
+
+        if len(candidates) == 1:
+            return query_enc
+
+        expanded = np.mean(np.vstack(candidates), axis=0)
+        norm = np.linalg.norm(expanded)
+        return expanded / norm if norm > 0 else expanded
+
+    def _query_expansion(self):
+        """使用用户勾选结果或Top-5结果对查询向量做Query Expansion并重新检索。"""
+        if not self.database_loaded or self.query_image is None:
+            messagebox.showwarning("Warning", "Please load database and select image first")
+            return
+        if not self.current_results:
+            messagebox.showwarning("Warning", "Please run search first")
+            return
+
+        algo, method, use_idf = self.algorithm_var.get(), self.encoding_var.get(), self.use_idf_var.get()
+        self.status_var.set("Query Expansion...")
+
+        query_enc, ext_time = self._get_query_encoding(algo, method, use_idf)
+        encoder = self.encoder if algo == "SIFT" else self.orb_encoder
+        desc_key = 'sift_desc' if algo == "SIFT" else 'orb_desc'
+
+        selected_indices = [i for i, var in enumerate(self.result_vars[:len(self.current_results)]) if var.get()]
+        candidates = [query_enc]
+
+        if selected_indices:
+            selected_results = [self.current_results[i] for i in selected_indices]
+            source_results = selected_results
+        else:
+            source_results = self.current_results[:self.qe_k_var.get()]
+
+        for r in source_results:
+            desc = self.database_data.get(r['path'], {}).get(desc_key)
+            if desc is None:
+                continue
+            candidates.append(encoder.encode(desc, method, use_idf))
+
+        expanded_query = np.mean(np.vstack(candidates), axis=0)
+        norm = np.linalg.norm(expanded_query)
+        if norm > 0:
+            expanded_query = expanded_query / norm
+
+        results, search_time = self._search_with_encoding(expanded_query, algo, method, use_idf, exclude_path=self.query_path, k=10)
+
+        self.current_results = results
+        self.query_expanded = True
+        self._show_results(results, ext_time, search_time, algo, method, use_idf)
+        for var in self.result_vars:
+            var.set(False)
+        self.status_var.set("Query Expansion Done")
+
     def _show_results(self, results, ext_time, search_time, algo, method, use_idf):
         """
         显示检索结果
@@ -625,27 +778,32 @@ class ImageSearchApp:
         - 绿色边框：与查询图像同类别（正确匹配）
         - 红色边框：不同类别（错误匹配）
         """
-        # 从路径中提取查询图像的真实标签（父文件夹名）
         query_label = os.path.basename(os.path.dirname(self.query_path))
-        
+
+        # 清空所有结果槽位
+        for i in range(len(self.result_canvases)):
+            self.result_vars[i].set(False)
+            self.result_label_vars[i].set("")
+            self.result_label_widgets[i].config(foreground="black")
+            self.result_canvases[i].delete("all")
+
         # 显示Top10结果图像，并用彩色边框标注正确/错误
         for i, canvas in enumerate(self.result_canvases):
             if i < len(results):
                 r = results[i]
-                self._display_image(cv2.imread(r['path']), canvas, f"{i+1}. {r['label']}")
-                canvas.update()
-                # 同标签=绿色边框，不同=红色边框
                 color = "green" if r['label'] == query_label else "red"
-                cw, ch = canvas.winfo_width(), canvas.winfo_height()
-                canvas.create_rectangle(2, 2, cw-2, ch-2, outline=color, width=3)
+                self.result_label_vars[i].set(f"{i+1}. {r['label']}")
+                self.result_label_widgets[i].config(foreground=color)
+                self._display_image(cv2.imread(r['path']), canvas)
+                canvas.update()
+                canvas.create_rectangle(1, 1, canvas.winfo_width()-1, canvas.winfo_height()-1,
+                                        outline=color, width=3)
             else:
                 canvas.delete("all")
-        
-        # 计算Top10精度
+
         retrieved = [r['label'] for r in results]
-        precision = sum(1 for l in retrieved if l == query_label) / len(retrieved)
-        
-        # 在信息文本框显示检索详情
+        precision = sum(1 for l in retrieved if l == query_label) / len(retrieved) if retrieved else 0
+
         idf_str = " (TF-IDF)" if use_idf else ""
         info = f"=== Search Results ===\n"
         info += f"Method: {algo} + {method}{idf_str}\n"
@@ -655,12 +813,11 @@ class ImageSearchApp:
         info += f"Top10 Precision: {precision*100:.1f}%\n\n"
         info += "=== Top10 Results ===\n"
         for i, r in enumerate(results):
-            mark = "Y" if r['label'] == query_label else "N"  # Y=正确，N=错误
+            mark = "Y" if r['label'] == query_label else "N"
             info += f"{i+1}. [{mark}] {r['label']} (dist:{r['distance']:.4f})\n"
-        
+
         self.info_text.insert(tk.END, info)
         self.status_var.set(f"Done. Precision: {precision*100:.1f}%")
-        # 绘制该查询的PR曲线
         self._plot_single_query_pr(results, query_label)
     
     # =========================================================================
@@ -1091,21 +1248,27 @@ class ImageSearchApp:
         显示重排序后的结果
         """
         query_label = os.path.basename(os.path.dirname(self.query_path))
-        
+
+        for i in range(len(self.result_canvases)):
+            self.result_canvases[i].delete("all")
+            self.result_label_vars[i].set("")
+            self.result_label_widgets[i].config(foreground="black")
+            self.result_vars[i].set(False)
+
         for i, canvas in enumerate(self.result_canvases):
             if i < len(results):
                 r = results[i]
-                self._display_image(cv2.imread(r['path']), canvas, f"{i+1}. {r['label']}")
-                canvas.update()
                 color = "green" if r['label'] == query_label else "red"
-                cw, ch = canvas.winfo_width(), canvas.winfo_height()
-                canvas.create_rectangle(2, 2, cw-2, ch-2, outline=color, width=3)
-            else:
-                canvas.delete("all")
-        
+                self.result_label_vars[i].set(f"{i+1}. {r['label']}")
+                self.result_label_widgets[i].config(foreground=color)
+                self._display_image(cv2.imread(r['path']), canvas)
+                canvas.update()
+                canvas.create_rectangle(1, 1, canvas.winfo_width() - 1, canvas.winfo_height() - 1,
+                                        outline=color, width=3)
+
         retrieved = [r['label'] for r in results]
         precision = sum(1 for l in retrieved if l == query_label) / len(retrieved) if retrieved else 0
-        
+
         algo, method, use_idf = self.algorithm_var.get(), self.encoding_var.get(), self.use_idf_var.get()
         idf_str = " (TF-IDF)" if use_idf else ""
         info = f"=== Reordered Results ===\n"
@@ -1121,10 +1284,10 @@ class ImageSearchApp:
             info += f"{i+1}. [{mark}] {r['label']} ({score_key}:{r[score_key]:.4f})\n"
             if 'sim_color' in r:
                 info += f"    Color:{r['sim_color']:.3f} Tex:{r['sim_texture']:.3f} Shape:{r['sim_shape']:.3f}\n"
-        
+
         self.info_text.delete(1.0, tk.END)
         self.info_text.insert(tk.END, info)
-        
+
         labels = [r['label'] for r in results]
         total_rel = self.evaluator.label_counts.get(query_label, 1)
         precs, recs = [], []
